@@ -47,4 +47,7 @@ public:
 
 	/** Get display-friendly name from an asset path */
 	static FString GetAssetName(const FString& AssetPath);
+
+	/** Resolve a save destination and reject transient, unmapped or read-only packages without changing file attributes. */
+	static bool CanSavePackage(UPackage* Package, FString& OutFilename, FString& OutError);
 };

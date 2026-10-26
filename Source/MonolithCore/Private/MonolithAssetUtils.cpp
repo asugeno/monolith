@@ -7,6 +7,35 @@
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UObjectHash.h"
 #include "UObject/Package.h"
+#include "HAL/FileManager.h"
+#include "Misc/PackageName.h"
+
+bool FMonolithAssetUtils::CanSavePackage(UPackage* Package, FString& OutFilename, FString& OutError)
+{
+	OutFilename.Reset();
+	OutError.Reset();
+	if (!IsValid(Package) || Package == GetTransientPackage() || Package->HasAnyFlags(RF_Transient) || Package->HasAnyPackageFlags(PKG_CompiledIn))
+	{
+		OutError = TEXT("Cannot save an invalid, transient or compiled-in package");
+		return false;
+	}
+
+	const FString PackageName = Package->GetName();
+	const FString Extension = Package->ContainsMap() ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension();
+	if (!FPackageName::IsValidLongPackageName(PackageName) || !FPackageName::TryConvertLongPackageNameToFilename(PackageName, OutFilename, Extension))
+	{
+		OutError = FString::Printf(TEXT("Package has no writable mounted save path: %s"), *PackageName);
+		return false;
+	}
+
+	OutFilename = FPaths::ConvertRelativePathToFull(OutFilename);
+	if (IFileManager::Get().IsReadOnly(*OutFilename))
+	{
+		OutError = FString::Printf(TEXT("Save blocked: file is read-only: %s. Check it out or make it writable before saving; in-memory changes have been retained."), *OutFilename);
+		return false;
+	}
+	return true;
+}
 
 FString FMonolithAssetUtils::ResolveAssetPath(const FString& InPath)
 {

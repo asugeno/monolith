@@ -641,6 +641,13 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleSaveAsset(const TS
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
 	}
 
+	FString Filename;
+	FString SaveError;
+	if (!FMonolithAssetUtils::CanSavePackage(Asset->GetOutermost(), Filename, SaveError))
+	{
+		return FMonolithActionResult::Error(SaveError);
+	}
+
 	bool bWasDirty = Asset->GetOutermost()->IsDirty();
 	bool bSaved = UEditorAssetLibrary::SaveLoadedAsset(Asset, false);
 
@@ -688,6 +695,13 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleSaveDirtyAssets(co
 		}
 
 		const FString AssetPath = BP->GetPathName();
+		FString Filename;
+		FString SaveError;
+		if (!FMonolithAssetUtils::CanSavePackage(Pkg, Filename, SaveError))
+		{
+			FailedArr.Add(MakeShared<FJsonValueString>(AssetPath));
+			continue;
+		}
 		const bool bSaved = UEditorAssetLibrary::SaveLoadedAsset(BP, false);
 		(bSaved ? SavedArr : FailedArr).Add(MakeShared<FJsonValueString>(AssetPath));
 	}

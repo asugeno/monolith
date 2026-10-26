@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Blueprint save preflight.** `blueprint.save_asset` and `blueprint.save_dirty_assets` reject read-only destinations and unsaveable package paths before entering the engine save flow, preserving in-memory edits and file attributes. This extends the explicit-save protection beyond `editor.save_packages`; its existing source-control checkout and dry-run behavior remain unchanged.
+
 ## [0.24.0] - 2026-10-18
 
 > **Action count is approximate.** **~1,400+ actions across 26 in-tree namespaces** — query `monolith_discover()` for the live figure.
