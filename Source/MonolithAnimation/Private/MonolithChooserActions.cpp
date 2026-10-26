@@ -545,7 +545,10 @@ FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const 
 			FString Val;
 			if (Pair.Value.IsValid() && Pair.Value->TryGetString(Val))
 			{
-				Remap.Add(NormalizePackagePath(MonolithKeyToString(Pair.Key)), Val);
+				// UE 5.8: FJsonObject::Values keys are UE::FSharedString (non-legacy
+				// JsonObject storage), not FString. Convert via operator* -> const TCHAR*.
+				const FString Key(*Pair.Key);
+				Remap.Add(NormalizePackagePath(Key), Val);
 			}
 		}
 	}

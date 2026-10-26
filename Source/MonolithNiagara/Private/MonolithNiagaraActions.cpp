@@ -5239,6 +5239,180 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleEnabled(const TSha
 	return NA_SuccessStr(bEnabled ? TEXT("Module enabled") : TEXT("Module disabled"));
 }
 
+namespace MonolithNiagaraRapidIteration
+{
+	// Mirrors FNiagaraStackGraphUtilities::IsRapidIterationType (not exported from NiagaraEditor).
+	static bool IsRapidIterationType(const FNiagaraTypeDefinition& Type)
+	{
+		if (!Type.IsValid() || Type.IsStatic()) return false;
+		return Type != FNiagaraTypeDefinition::GetBoolDef() && !Type.IsEnum()
+			&& Type != FNiagaraTypeDefinition::GetParameterMapDef() && !Type.IsUObject();
+	}
+
+	// Parses "1,2,3", "(X=1,Y=2,Z=3)", "(R=1,G=0.5,B=0,A=1)" etc. into the raw value memory of a
+	// numeric Niagara type (int32 or a struct made only of floats). Returns false for other types.
+	static bool ParseNumericValue(const FNiagaraTypeDefinition& Type, const FString& ValStr, TArray<uint8>& OutData)
+	{
+		FString Clean = ValStr;
+		Clean.ReplaceInline(TEXT("("), TEXT(""));
+		Clean.ReplaceInline(TEXT(")"), TEXT(""));
+		TArray<FString> Parts;
+		Clean.ParseIntoArray(Parts, TEXT(","), true);
+		TArray<double> Numbers;
+		for (FString Part : Parts)
+		{
+			int32 EqIdx = INDEX_NONE;
+			if (Part.FindChar(TEXT('='), EqIdx)) Part = Part.Mid(EqIdx + 1);
+			Part.TrimStartAndEndInline();
+			if (Part.IsEmpty() || !Part.IsNumeric()) return false;
+			Numbers.Add(FCString::Atod(*Part));
+		}
+
+		const int32 Size = Type.GetSize();
+		if (Numbers.Num() == 0 || Size <= 0) return false;
+		OutData.SetNumZeroed(Size);
+		if (Type == FNiagaraTypeDefinition::GetIntDef())
+		{
+			const int32 IntValue = FMath::RoundToInt(Numbers[0]);
+			FMemory::Memcpy(OutData.GetData(), &IntValue, sizeof(int32));
+			return true;
+		}
+		// Float based types (float / vec2 / vec3 / position / vec4 / color / quat) are tightly packed floats.
+		if (Size % sizeof(float) != 0) return false;
+		const int32 NumFloats = Size / sizeof(float);
+		if (Numbers.Num() != NumFloats && Numbers.Num() != 1) return false;
+		float* Floats = reinterpret_cast<float*>(OutData.GetData());
+		for (int32 Idx = 0; Idx < NumFloats; ++Idx)
+		{
+			Floats[Idx] = static_cast<float>(Numbers.Num() == 1 ? Numbers[0] : Numbers[Idx]);
+		}
+		return true;
+	}
+
+	// Writes a literal module input the same way the Niagara stack editor does
+	// (UNiagaraStackFunctionInput::SetLocalValue): rapid-iteration-eligible inputs are stored in the
+	// RapidIterationParameters of every affected script, NOT as an override pin default (the compiler
+	// ignores literal override pins for these types, so the value never reaches the game).
+	// Any existing override pin is removed so the rapid iteration parameter is the one used.
+	static bool WriteRapidIterationValue(
+		UNiagaraSystem& System,
+		int32 EmitterIdx,
+		ENiagaraScriptUsage Usage,
+		UNiagaraNodeFunctionCall& ModuleNode,
+		const FNiagaraParameterHandle& AliasedHandle,
+		const FNiagaraTypeDefinition& InputType,
+		const TArray<uint8>& Data,
+		int32& OutScriptCount)
+	{
+		OutScriptCount = 0;
+		const bool bSystemUsage = Usage == ENiagaraScriptUsage::SystemSpawnScript || Usage == ENiagaraScriptUsage::SystemUpdateScript;
+		FString UniqueEmitterName;
+		TArray<UNiagaraScript*> Scripts;
+		if (EmitterIdx != INDEX_NONE)
+		{
+			FVersionedNiagaraEmitter VE = System.GetEmitterHandles()[EmitterIdx].GetInstance();
+			if (VE.Emitter) UniqueEmitterName = VE.Emitter->GetUniqueEmitterName();
+			if (FVersionedNiagaraEmitterData* EmitterData = VE.GetEmitterData())
+			{
+				TArray<UNiagaraScript*> EmitterScripts;
+				EmitterData->GetScripts(EmitterScripts, false);
+				for (UNiagaraScript* Script : EmitterScripts)
+				{
+					if (Script && Script->ContainsUsage(Usage)) Scripts.Add(Script);
+				}
+			}
+		}
+		else if (!bSystemUsage)
+		{
+			return false;
+		}
+		// Emitter scripts are also compiled into the system scripts, so the engine updates both.
+		if (UNiagaraScript* SystemSpawn = System.GetSystemSpawnScript()) Scripts.AddUnique(SystemSpawn);
+		if (UNiagaraScript* SystemUpdate = System.GetSystemUpdateScript()) Scripts.AddUnique(SystemUpdate);
+
+		const FNiagaraVariable InputVariable(InputType, AliasedHandle.GetParameterHandleString());
+		const FNiagaraVariable RapidIterationVariable = FNiagaraUtilities::ConvertVariableToRapidIterationConstantName(
+			InputVariable, bSystemUsage ? nullptr : *UniqueEmitterName, Usage);
+
+		if (UEdGraphPin* OverridePin = MonolithNiagaraHelpers::GetStackFunctionInputOverridePin(ModuleNode, AliasedHandle))
+		{
+			if (UEdGraphNode* OverrideNode = OverridePin->GetOwningNode(); OverrideNode && OverrideNode != &ModuleNode)
+			{
+				OverrideNode->Modify();
+				OverridePin->BreakAllPinLinks();
+				OverrideNode->RemovePin(OverridePin);
+				// NotifyGraphNeedsRecompile is not exported from Niagara; NotifyGraphChanged also marks it for recompile.
+				if (UNiagaraGraph* Graph = ModuleNode.GetNiagaraGraph()) Graph->NotifyGraphChanged();
+			}
+		}
+
+		for (UNiagaraScript* Script : Scripts)
+		{
+			Script->Modify();
+			Script->RapidIterationParameters.SetParameterData(Data.GetData(), RapidIterationVariable, true);
+			++OutScriptCount;
+		}
+		return OutScriptCount > 0;
+	}
+
+	// Reads the rapid iteration parameter value of a literal module input (as the compiled game uses it).
+	// Returns false when the input has no rapid iteration parameter in the emitter script for the usage.
+	static bool ReadRapidIterationValue(
+		UNiagaraSystem& System,
+		int32 EmitterIdx,
+		ENiagaraScriptUsage Usage,
+		const FNiagaraParameterHandle& AliasedHandle,
+		const FNiagaraTypeDefinition& InputType,
+		FString& OutValue)
+	{
+		if (!IsRapidIterationType(InputType)) return false;
+		const bool bSystemUsage = Usage == ENiagaraScriptUsage::SystemSpawnScript || Usage == ENiagaraScriptUsage::SystemUpdateScript;
+		FString UniqueEmitterName;
+		UNiagaraScript* SourceScript = nullptr;
+		if (EmitterIdx != INDEX_NONE)
+		{
+			FVersionedNiagaraEmitter VE = System.GetEmitterHandles()[EmitterIdx].GetInstance();
+			if (VE.Emitter) UniqueEmitterName = VE.Emitter->GetUniqueEmitterName();
+			if (FVersionedNiagaraEmitterData* EmitterData = VE.GetEmitterData())
+			{
+				TArray<UNiagaraScript*> EmitterScripts;
+				EmitterData->GetScripts(EmitterScripts, false);
+				for (UNiagaraScript* Script : EmitterScripts)
+				{
+					if (Script && Script->ContainsUsage(Usage)) { SourceScript = Script; break; }
+				}
+			}
+		}
+		else if (bSystemUsage)
+		{
+			SourceScript = Usage == ENiagaraScriptUsage::SystemSpawnScript ? System.GetSystemSpawnScript() : System.GetSystemUpdateScript();
+		}
+		if (!SourceScript) return false;
+
+		const FNiagaraVariable InputVariable(InputType, AliasedHandle.GetParameterHandleString());
+		const FNiagaraVariable RapidIterationVariable = FNiagaraUtilities::ConvertVariableToRapidIterationConstantName(
+			InputVariable, bSystemUsage ? nullptr : *UniqueEmitterName, Usage);
+		const uint8* Data = SourceScript->RapidIterationParameters.GetParameterData(RapidIterationVariable);
+		if (!Data) return false;
+
+		if (InputType == FNiagaraTypeDefinition::GetIntDef())
+		{
+			OutValue = FString::FromInt(*reinterpret_cast<const int32*>(Data));
+			return true;
+		}
+		const int32 Size = InputType.GetSize();
+		if (Size <= 0 || Size % sizeof(float) != 0) return false;
+		const float* Floats = reinterpret_cast<const float*>(Data);
+		TArray<FString> Parts;
+		for (int32 Idx = 0; Idx < Size / static_cast<int32>(sizeof(float)); ++Idx)
+		{
+			Parts.Add(FString::SanitizeFloat(Floats[Idx]));
+		}
+		OutValue = FString::Join(Parts, TEXT(","));
+		return true;
+	}
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SystemPath = NA_GetAssetPath(Params);
@@ -5341,23 +5515,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 			TargetPin->BreakAllPinLinks();
 		}
 	}
-	else
-	{
-		// Standard path: use the ParameterMap override pin system
-		FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-			FNiagaraParameterHandle(MatchedFullName), MN);
-
-		// UE 5.7 FIX: 5-param version of GetOrCreateStackFunctionInputOverridePin
-		UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
-			*MN, AH, InputType, FGuid(), FGuid());
-
-		// Guard: break existing links so the literal DefaultValue actually takes effect
-		if (OverridePin.LinkedTo.Num() > 0)
-		{
-			OverridePin.BreakAllPinLinks();
-		}
-		TargetPin = &OverridePin;
-	}
+	// Standard path: the target (rapid iteration parameter or override pin) is chosen after the value
+	// string is built, because numeric inputs must go to RapidIterationParameters.
+	const FNiagaraParameterHandle AliasedHandle = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+		FNiagaraParameterHandle(MatchedFullName), MN);
 
 	// A structured value arrives either as EJson::Object or — when the MCP layer serialises a nested
 	// param — as a string holding the serialized object. Normalise both, else the raw JSON text lands
@@ -5386,6 +5547,36 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 	else if (JV->Type == EJson::Boolean) ValStr = JV->AsBool() ? TEXT("true") : TEXT("false");
 	else if (JV->Type == EJson::String) ValStr = JV->AsString();
 	else ValStr = JsonValueToString(JV);
+
+	if (!bCustomHlslFallback)
+	{
+		TArray<uint8> RapidData;
+		if (MonolithNiagaraRapidIteration::IsRapidIterationType(InputType)
+			&& MonolithNiagaraRapidIteration::ParseNumericValue(InputType, ValStr, RapidData))
+		{
+			int32 ScriptCount = 0;
+			if (MonolithNiagaraRapidIteration::WriteRapidIterationValue(
+				*System, EmitterIdx, FoundUsage, *MN, AliasedHandle, InputType, RapidData, ScriptCount))
+			{
+				GEditor->EndTransaction();
+				System->RequestCompile(false);
+				return NA_SuccessStr(FString::Printf(
+					TEXT("Set input '%s' = '%s' (rapid iteration parameter, %d scripts)"), *InputName, *ValStr, ScriptCount));
+			}
+		}
+
+		// Non-numeric / non-rapid-iteration inputs keep using the ParameterMap override pin.
+		// UE 5.7 FIX: 5-param version of GetOrCreateStackFunctionInputOverridePin
+		UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+			*MN, AliasedHandle, InputType, FGuid(), FGuid());
+
+		// Guard: break existing links so the literal DefaultValue actually takes effect
+		if (OverridePin.LinkedTo.Num() > 0)
+		{
+			OverridePin.BreakAllPinLinks();
+		}
+		TargetPin = &OverridePin;
+	}
 
 	TargetPin->DefaultValue = ValStr;
 	GEditor->EndTransaction();
@@ -8987,6 +9178,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 			return NA_SuccessObj(R);
 		}
 
+		// Literal values of numeric inputs live in the scripts' RapidIterationParameters, not on a pin.
+		FString RapidValue;
+		if (MonolithNiagaraRapidIteration::ReadRapidIterationValue(*System, EmitterIdx, FoundUsage, AH, InputType, RapidValue))
+		{
+			R->SetStringField(TEXT("value"), RapidValue);
+			R->SetBoolField(TEXT("is_default"), false);
+			R->SetBoolField(TEXT("is_linked"), false);
+			R->SetBoolField(TEXT("is_dynamic_input"), false);
+			R->SetStringField(TEXT("source"), TEXT("rapid_iteration_parameter"));
+			return NA_SuccessObj(R);
+		}
 		R->SetStringField(TEXT("value"), TEXT("(default)"));
 		R->SetBoolField(TEXT("is_default"), true);
 		R->SetBoolField(TEXT("is_linked"), false);
