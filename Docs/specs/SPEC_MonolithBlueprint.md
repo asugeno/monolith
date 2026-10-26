@@ -10,6 +10,8 @@
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, BlueprintGraph, EnhancedInput, Json, JsonUtilities
 
+**Explicit save safety:** `save_asset` and `save_dirty_assets` preflight package paths and file read-only attributes through `FMonolithAssetUtils::CanSavePackage`. A blocked save preserves in-memory edits, dirty state, and file attributes. `save_asset` returns an error explaining the rejection; `save_dirty_assets` includes the asset in its existing `failed[]` result. These entry points do not automatically check out read-only files.
+
 ### Classes
 
 | Class | Responsibility |
